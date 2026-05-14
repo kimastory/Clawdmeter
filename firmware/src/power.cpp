@@ -2,6 +2,36 @@
 #include "display_cfg.h"
 #include <Arduino.h>
 
+#ifdef M5STACK_CORE2
+
+static bool pwr_pressed_flag = false;
+
+void power_init(void) {
+    Serial.println("M5Stack Core2 power init OK");
+}
+
+void power_tick(void) {
+    if (M5.BtnPWR.wasClicked()) {
+        pwr_pressed_flag = true;
+    }
+}
+
+int power_battery_pct(void) {
+    return M5.Power.getBatteryLevel();
+}
+
+bool power_is_charging(void) {
+    return M5.Power.isCharging();
+}
+
+bool power_pwr_pressed(void) {
+    if (!pwr_pressed_flag) return false;
+    pwr_pressed_flag = false;
+    return true;
+}
+
+#else
+
 // Poll intervals
 #define BATTERY_POLL_MS   2000
 #define CHARGING_POLL_MS  500
@@ -72,3 +102,5 @@ bool power_pwr_pressed(void) {
     }
     return false;
 }
+
+#endif

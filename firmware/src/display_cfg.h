@@ -1,5 +1,20 @@
 #pragma once
 
+#ifdef M5STACK_CORE2
+
+#include <lvgl.h>
+#define M5GFX_USING_REAL_LVGL 1
+#include <M5Unified.h>
+
+// ---- M5Stack Core2 AWS DevKit display resolution ----
+#define LCD_WIDTH   320
+#define LCD_HEIGHT  240
+
+// ---- Global hardware objects (defined in main.cpp) ----
+extern M5GFX *gfx;
+
+#else
+
 #include <Arduino_GFX_Library.h>
 #include <TouchDrvCSTXXX.hpp>
 #include <XPowersLib.h>
@@ -35,3 +50,5 @@ extern Arduino_CO5300 *gfx;
 extern TouchDrvCST92xx touch;
 extern XPowersPMU pmu;
 extern SensorQMI8658 imu;
+
+#endif

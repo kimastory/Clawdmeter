@@ -14,10 +14,15 @@
 //   BTN_BACK   (GPIO 0)  — left,  send Space (Claude Code voice mode push-to-talk)
 //   BTN_FWD    (GPIO 18) — right, send Shift+Tab (Claude Code mode toggle)
 //   AXP PWR    (PMU)     — middle, cycle screens; on splash, cycle animations
+#ifndef M5STACK_CORE2
 #define BTN_BACK 0
 #define BTN_FWD  18
+#endif
 
 // ---- Hardware objects ----
+#ifdef M5STACK_CORE2
+M5GFX *gfx = &M5.Display;
+#else
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
 Arduino_CO5300 *gfx = new Arduino_CO5300(
@@ -26,10 +31,12 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 TouchDrvCST92xx touch;
 XPowersPMU pmu;
 SensorQMI8658 imu;
+#endif
 
 static UsageData usage = {};
 
 // ---- Touch interrupt + shared state ----
+#ifndef M5STACK_CORE2
 static volatile bool     touch_pressed = false;
 static volatile uint16_t touch_x = 0;
 static volatile uint16_t touch_y = 0;
@@ -53,6 +60,7 @@ static void touch_read() {
         touch_pressed = false;
     }
 }
+#endif
 
 // ---- LVGL draw buffers (PSRAM-backed, partial render) ----
 #define BUF_LINES 40
@@ -122,6 +130,11 @@ static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_m
     int32_t w = area->x2 - area->x1 + 1;
     int32_t h = area->y2 - area->y1 + 1;
     uint16_t *src = (uint16_t*)px_map;
+#ifdef M5STACK_CORE2
+    gfx->startWrite();
+    gfx->pushImage(area->x1, area->y1, w, h, src);
+    gfx->endWrite();
+#else
     uint8_t r = imu_get_rotation();
 
     if (r == 0) {
@@ -131,6 +144,7 @@ static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_m
         rotate_strip(src, w, h, area->x1, area->y1, r, &dx, &dy, &dw, &dh);
         gfx->draw16bitRGBBitmap(dx, dy, rot_buf, dw, dh);
     }
+#endif
     lv_display_flush_ready(disp);
 }
 
@@ -145,6 +159,16 @@ static void rounder_cb(lv_event_t* e) {
 
 // LVGL touch callback
 static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
+#ifdef M5STACK_CORE2
+    auto t = M5.Touch.getDetail();
+    if (t.isPressed()) {
+        data->point.x = t.x;
+        data->point.y = t.y;
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+#else
     if (touch_pressed) {
         data->point.x = touch_x;
         data->point.y = touch_y;
@@ -152,6 +176,7 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
+#endif
 }
 
 // Parse a JSON line into UsageData
@@ -173,8 +198,20 @@ static bool parse_json(const char* json, UsageData* out) {
     return true;
 }
 
-// Serial command buffer
-#define CMD_BUF_SIZE 64
+static void apply_usage_update(void) {
+    int g_before = usage_rate_group();
+    usage_rate_sample(usage.session_pct);
+    int g_after = usage_rate_group();
+    if (g_after != g_before) {
+        Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+            g_before, g_after, usage.session_pct);
+        if (splash_is_active()) splash_pick_for_current_rate();
+    }
+    ui_update(&usage);
+}
+
+// Serial command buffer. It also accepts the same compact JSON payload as BLE.
+#define CMD_BUF_SIZE 512
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -215,6 +252,13 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) {
                 send_screenshot();
+            } else if (cmd_pos > 0 && cmd_buf[0] == '{') {
+                if (parse_json(cmd_buf, &usage)) {
+                    apply_usage_update();
+                    Serial.println("SERIAL_ACK");
+                } else {
+                    Serial.println("SERIAL_NACK");
+                }
             }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
@@ -228,6 +272,15 @@ void setup() {
     delay(300);
     Serial.println("{\"ready\":true}");
 
+#ifdef M5STACK_CORE2
+    auto cfg = M5.config();
+    cfg.serial_baudrate = 115200;
+    M5.begin(cfg);
+    gfx->setColorDepth(16);
+    gfx->setSwapBytes(true);
+    gfx->setBrightness(160);
+    gfx->fillScreen(TFT_BLACK);
+#else
     // Init I2C (shared by touch + PMU)
     Wire.begin(IIC_SDA, IIC_SCL);
 
@@ -253,6 +306,7 @@ void setup() {
         attachInterrupt(TP_INT, touch_isr, FALLING);
         Serial.println("Touch init OK");
     }
+#endif
 
     // Init LVGL
     lv_init();
@@ -271,8 +325,10 @@ void setup() {
     lv_display_set_buffers(disp, buf1, buf2, LCD_WIDTH * BUF_LINES * 2,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
+#ifndef M5STACK_CORE2
     // CO5300 even-alignment rounder
     lv_display_add_event_cb(disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+#endif
 
     lv_indev_t* indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
@@ -282,8 +338,10 @@ void setup() {
     ble_init();
 
     // Physical buttons: back (GPIO 0) and forward (GPIO 18)
+#ifndef M5STACK_CORE2
     pinMode(BTN_BACK, INPUT_PULLUP);
     pinMode(BTN_FWD,  INPUT_PULLUP);
+#endif
 
     // Build dashboard
     ui_init();
@@ -331,7 +389,11 @@ static void handle_rotation_change(void) {
 }
 
 void loop() {
+#ifdef M5STACK_CORE2
+    M5.update();
+#else
     touch_read();
+#endif
     lv_timer_handler();
     ui_tick_anim();
     ble_tick();
@@ -344,6 +406,27 @@ void loop() {
     //   RIGHT (GPIO 18) → Shift+Tab (Claude Code mode toggle)
     //   PWR   (AXP)     → cycle screens; on splash, cycle animations
     {
+#ifdef M5STACK_CORE2
+        static bool back_was = false, fwd_was = false;
+        bool back_now = M5.BtnA.isPressed();
+        bool fwd_now  = M5.BtnC.isPressed();
+
+        if (back_now != back_was) {
+            if (back_now) ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+            else          ble_keyboard_release();
+            back_was = back_now;
+        }
+        if (fwd_now != fwd_was) {
+            if (fwd_now) ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+            else         ble_keyboard_release();
+            fwd_was = fwd_now;
+        }
+
+        if (M5.BtnB.wasClicked() || power_pwr_pressed()) {
+            if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
+            else                                          ui_cycle_screen();
+        }
+#else
         static bool back_was = false, fwd_was = false;
         bool back_now = (digitalRead(BTN_BACK) == LOW);
         bool fwd_now  = (digitalRead(BTN_FWD)  == LOW);
@@ -363,9 +446,12 @@ void loop() {
             if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
             else                                          ui_cycle_screen();
         }
+#endif
     }
 
+#ifndef M5STACK_CORE2
     handle_rotation_change();
+#endif
 
     // Update BLE status on screen when state changes
     ble_state_t bs = ble_get_state();
@@ -391,15 +477,7 @@ void loop() {
     // Process incoming BLE data
     if (ble_has_data()) {
         if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
+            apply_usage_update();
             ble_send_ack();
         } else {
             ble_send_nack();

@@ -8,6 +8,10 @@ firmware/.vscode/
 # Claude Code
 .claude/
 
+# macOS daemon local runtime
+.venv/
+daemon/*.log
+
 # Node tooling deps (npm install --no-save)
 tools/node_modules/
 tools/package-lock.json
