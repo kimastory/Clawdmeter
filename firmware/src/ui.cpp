@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "splash.h"
+#include <Arduino.h>
 #include <lvgl.h>
 #include "logo.h"
 #include "icons.h"
@@ -98,7 +99,9 @@ static uint8_t anim_spinner_idx = 0;
 static uint8_t anim_phase = 0;
 static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
+static uint32_t auto_switch_last_ms = 0;
 #define ANIM_MSG_MS     4000
+#define AUTO_SWITCH_MS  10000
 
 static const char* const spinner_frames[] = {
     "\xC2\xB7", "\xE2\x9C\xBB", "\xE2\x9C\xBD",
@@ -507,9 +510,15 @@ void ui_update(const UsageData* data) {
 }
 
 void ui_tick_anim(void) {
-    if (current_screen != SCREEN_USAGE) return;
+    uint32_t now = millis();
 
-    uint32_t now = lv_tick_get();
+    if ((current_screen == SCREEN_USAGE || current_screen == SCREEN_SPLASH) &&
+        now - auto_switch_last_ms >= AUTO_SWITCH_MS) {
+        ui_show_screen(current_screen == SCREEN_USAGE ? SCREEN_SPLASH : SCREEN_USAGE);
+        return;
+    }
+
+    if (current_screen != SCREEN_USAGE) return;
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
@@ -574,6 +583,9 @@ void ui_show_screen(screen_t screen) {
 
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
+    if (screen == SCREEN_USAGE || screen == SCREEN_SPLASH) {
+        auto_switch_last_ms = millis();
+    }
     apply_battery_visibility();
 }
 

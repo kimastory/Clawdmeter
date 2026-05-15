@@ -171,7 +171,14 @@ def usage_payload() -> dict[str, Any]:
     if not payload:
         payload = {"s": 0, "sr": 0, "w": 0, "wr": 0, "st": "no-data", "ok": False}
     now = datetime.now()
-    payload.update({"y": now.year, "m": now.month, "d": now.day})
+    payload.update({
+        "y": now.year,
+        "m": now.month,
+        "d": now.day,
+        "hh": now.hour,
+        "mm": now.minute,
+        "ss": now.second,
+    })
     return payload
 
 

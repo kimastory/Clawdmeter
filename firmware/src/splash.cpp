@@ -14,6 +14,8 @@
 #define CELL         5
 #define MASCOT_X     12
 #define MASCOT_Y     42
+#define CLOCK_Y      150
+#define CLOCK_W      112
 #define CAL_X        124
 #define CAL_Y        40
 #define CAL_W        184
@@ -27,6 +29,8 @@
 #define CELL         8
 #define MASCOT_X     20
 #define MASCOT_Y     100
+#define CLOCK_Y      270
+#define CLOCK_W      160
 #define CAL_X        200
 #define CAL_Y        92
 #define CAL_W        260
@@ -53,6 +57,7 @@ LV_FONT_DECLARE(font_styrene_12);
 
 static lv_obj_t *splash_container = NULL;
 static lv_obj_t *canvas = NULL;
+static lv_obj_t *clock_label = NULL;
 static lv_obj_t *label_status = NULL;     // shown only when no animations loaded
 static lv_obj_t *calendar_root = NULL;
 static lv_obj_t *calendar_title = NULL;
@@ -68,6 +73,11 @@ static bool active = false;
 static int shown_year = 0;
 static int shown_month = 0;
 static int shown_day = 0;
+static int clock_hour = 0;
+static int clock_minute = 0;
+static int clock_second = 0;
+static uint32_t clock_base_ms = 0;
+static int last_rendered_second = -1;
 
 // While splash is showing, auto-cycle to the next animation in the current
 // rate-driven group every this many ms.
@@ -235,6 +245,25 @@ static void init_calendar(lv_obj_t *parent) {
     }
 }
 
+static void render_clock(void) {
+    if (!clock_label || clock_base_ms == 0) return;
+
+    uint32_t elapsed = (millis() - clock_base_ms) / 1000;
+    int total = clock_hour * 3600 + clock_minute * 60 + clock_second + (int)elapsed;
+    total %= 24 * 3600;
+
+    int hour24 = total / 3600;
+    int minute = (total / 60) % 60;
+    int second = total % 60;
+    if (second == last_rendered_second) return;
+    last_rendered_second = second;
+
+    int hour12 = hour24 % 12;
+    if (hour12 == 0) hour12 = 12;
+    lv_label_set_text_fmt(clock_label, "%s %d:%02d:%02d",
+                          hour24 < 12 ? "AM" : "PM", hour12, minute, second);
+}
+
 void splash_init(lv_obj_t *parent) {
     canvas_buf = (uint16_t*)heap_caps_malloc(CANVAS_W * CANVAS_H * 2, MALLOC_CAP_SPIRAM);
     if (!canvas_buf) {
@@ -255,6 +284,14 @@ void splash_init(lv_obj_t *parent) {
     lv_canvas_set_buffer(canvas, canvas_buf, CANVAS_W, CANVAS_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(canvas, MASCOT_X, MASCOT_Y);
     lv_obj_add_flag(canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    clock_label = lv_label_create(splash_container);
+    lv_label_set_text(clock_label, "AM --:--:--");
+    lv_obj_set_style_text_font(clock_label, &CAL_FONT_HDR, 0);
+    lv_obj_set_style_text_color(clock_label, THEME_TEXT, 0);
+    lv_obj_set_size(clock_label, CLOCK_W, 24);
+    lv_obj_set_style_text_align(clock_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(clock_label, MASCOT_X - 6, CLOCK_Y);
 
     init_calendar(splash_container);
 
@@ -284,7 +321,9 @@ void splash_init(lv_obj_t *parent) {
 }
 
 void splash_tick(void) {
-    if (!active || SPLASH_ANIM_COUNT == 0) return;
+    if (!active) return;
+    render_clock();
+    if (SPLASH_ANIM_COUNT == 0) return;
 
     // Auto-rotate to the next animation in the current group.
     if (millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
@@ -334,11 +373,22 @@ void splash_pick_for_current_rate(void) {
 
 void splash_update_calendar(const UsageData* data) {
     if (!data || data->year <= 0 || data->month <= 0 || data->day <= 0) return;
-    if (data->year == shown_year && data->month == shown_month && data->day == shown_day) return;
-    shown_year = data->year;
-    shown_month = data->month;
-    shown_day = data->day;
-    calendar_render(shown_year, shown_month, shown_day);
+    if (data->hour >= 0 && data->hour < 24 &&
+        data->minute >= 0 && data->minute < 60 &&
+        data->second >= 0 && data->second < 60) {
+        clock_hour = data->hour;
+        clock_minute = data->minute;
+        clock_second = data->second;
+        clock_base_ms = millis();
+        last_rendered_second = -1;
+        render_clock();
+    }
+    if (data->year != shown_year || data->month != shown_month || data->day != shown_day) {
+        shown_year = data->year;
+        shown_month = data->month;
+        shown_day = data->day;
+        calendar_render(shown_year, shown_month, shown_day);
+    }
 }
 
 bool splash_is_active(void) { return active; }

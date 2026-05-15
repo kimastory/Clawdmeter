@@ -202,6 +202,9 @@ static bool parse_json(const char* json, UsageData* out) {
     out->year = doc["y"] | 0;
     out->month = doc["m"] | 0;
     out->day = doc["d"] | 0;
+    out->hour = doc["hh"] | 0;
+    out->minute = doc["mm"] | 0;
+    out->second = doc["ss"] | 0;
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;

@@ -10,6 +10,9 @@ struct UsageData {
     int year;                // local calendar year from host
     int month;               // local calendar month (1-12)
     int day;                 // local calendar day (1-31)
+    int hour;                // local hour from host (0-23)
+    int minute;              // local minute from host (0-59)
+    int second;              // local second from host (0-59)
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
