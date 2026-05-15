@@ -19,6 +19,9 @@ tools/package-lock.json
 # Mac daemon venv
 daemon/.venv/
 
+# Local Wi-Fi credentials for firmware builds
+firmware/src/wifi_config.h
+
 # Python bytecode cache
 __pycache__/
 *.pyc

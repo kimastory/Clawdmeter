@@ -502,6 +502,8 @@ void ui_update(const UsageData* data) {
 
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
+
+    splash_update_calendar(data);
 }
 
 void ui_tick_anim(void) {

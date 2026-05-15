@@ -14,8 +14,12 @@ import asyncio
 import glob
 import json
 import os
+import getpass
+import re
+import subprocess
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -27,10 +31,13 @@ POLL_INTERVAL = int(os.environ.get("CLAWDMETER_POLL_INTERVAL", "60"))
 SERIAL_PORT = os.environ.get("CLAWDMETER_SERIAL_PORT")
 TRANSPORT = os.environ.get("CLAWDMETER_TRANSPORT", "auto").lower()
 SERIAL_BAUD = int(os.environ.get("CLAWDMETER_SERIAL_BAUD", "115200"))
+HTTP_HOST = os.environ.get("CLAWDMETER_HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("CLAWDMETER_HTTP_PORT", "8787"))
 
 HOME = Path.home()
 CREDENTIALS = HOME / ".claude" / ".credentials.json"
 USAGE_CACHE = HOME / ".claude" / "plugins" / "oh-my-claudecode" / ".usage-cache-anthropic.json"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
 def log(message: str) -> None:
@@ -64,14 +71,57 @@ def read_cache_payload() -> dict[str, Any] | None:
     }
 
 
+def extract_access_token(blob: str) -> str | None:
+    blob = blob.strip()
+    if not blob:
+        return None
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        if isinstance(data.get("accessToken"), str):
+            return data["accessToken"]
+        for value in data.values():
+            if isinstance(value, dict) and isinstance(value.get("accessToken"), str):
+                return value["accessToken"]
+    match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', blob)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_\-.~+/=]{20,}", blob):
+        return blob
+    return None
+
+
 def read_access_token() -> str | None:
+    try:
+        out = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                getpass.getuser(),
+                "-w",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        token = extract_access_token(out.stdout)
+        if token:
+            return token
+    except Exception as exc:
+        log(f"Keychain token read failed: {exc}")
+
     if not CREDENTIALS.exists():
         return None
     try:
-        data = json.loads(CREDENTIALS.read_text())
-    except json.JSONDecodeError:
+        return extract_access_token(CREDENTIALS.read_text())
+    except OSError:
         return None
-    return data.get("accessToken")
 
 
 def poll_anthropic_payload() -> dict[str, Any] | None:
@@ -118,9 +168,34 @@ def poll_anthropic_payload() -> dict[str, Any] | None:
 
 def usage_payload() -> dict[str, Any]:
     payload = poll_anthropic_payload() or read_cache_payload()
-    if payload:
-        return payload
-    return {"s": 0, "sr": 0, "w": 0, "wr": 0, "st": "no-data", "ok": False}
+    if not payload:
+        payload = {"s": 0, "sr": 0, "w": 0, "wr": 0, "st": "no-data", "ok": False}
+    now = datetime.now()
+    payload.update({"y": now.year, "m": now.month, "d": now.day})
+    return payload
+
+
+class UsageHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path not in {"/", "/usage"}:
+            self.send_error(404)
+            return
+        body = json.dumps(usage_payload(), separators=(",", ":")).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        log("HTTP " + (fmt % args))
+
+
+def serve_http_loop() -> None:
+    server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), UsageHandler)
+    log(f"Serving usage at http://{HTTP_HOST}:{HTTP_PORT}/usage")
+    server.serve_forever()
 
 
 def find_serial_port() -> str | None:
@@ -213,7 +288,9 @@ async def send_loop() -> None:
 
 
 if __name__ == "__main__":
-    if TRANSPORT != "ble":
+    if TRANSPORT == "http":
+        serve_http_loop()
+    elif TRANSPORT != "ble":
         port = find_serial_port()
         if port:
             send_serial_loop(port)

@@ -1,5 +1,63 @@
 #include "ble.h"
 #include <Arduino.h>
+
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#endif
+
+#ifdef CLAWDMETER_WIFI_SSID
+
+#define DEVICE_NAME "WiFi"
+
+void ble_init(void) {
+    Serial.println("BLE disabled for WiFi build");
+}
+
+void ble_tick(void) {
+}
+
+ble_state_t ble_get_state(void) {
+    return BLE_STATE_DISCONNECTED;
+}
+
+const char* ble_get_device_name(void) {
+    return DEVICE_NAME;
+}
+
+const char* ble_get_mac_address(void) {
+    return "WiFi";
+}
+
+void ble_clear_bonds(void) {
+}
+
+bool ble_has_data(void) {
+    return false;
+}
+
+const char* ble_get_data(void) {
+    return "";
+}
+
+void ble_send_ack(void) {
+}
+
+void ble_send_nack(void) {
+}
+
+void ble_request_refresh(void) {
+}
+
+void ble_keyboard_press(uint8_t key, uint8_t modifier) {
+    (void)key;
+    (void)modifier;
+}
+
+void ble_keyboard_release(void) {
+}
+
+#else
+
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 
@@ -232,3 +290,5 @@ void ble_keyboard_release(void) {
     input_kbd->setValue(report, sizeof(report));
     input_kbd->notify();
 }
+
+#endif

@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include "display_cfg.h"
 #include "data.h"
 #include "ui.h"
@@ -9,6 +11,10 @@
 #include "imu.h"
 #include "splash.h"
 #include "usage_rate.h"
+
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#endif
 
 // Physical buttons (global, screen-independent):
 //   BTN_BACK   (GPIO 0)  — left,  send Space (Claude Code voice mode push-to-talk)
@@ -193,6 +199,9 @@ static bool parse_json(const char* json, UsageData* out) {
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
+    out->year = doc["y"] | 0;
+    out->month = doc["m"] | 0;
+    out->day = doc["d"] | 0;
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
@@ -208,6 +217,77 @@ static void apply_usage_update(void) {
         if (splash_is_active()) splash_pick_for_current_rate();
     }
     ui_update(&usage);
+}
+
+#ifndef CLAWDMETER_WIFI_SSID
+#define CLAWDMETER_WIFI_SSID ""
+#endif
+#ifndef CLAWDMETER_WIFI_PASS
+#define CLAWDMETER_WIFI_PASS ""
+#endif
+#ifndef CLAWDMETER_USAGE_URL
+#define CLAWDMETER_USAGE_URL ""
+#endif
+
+#define WIFI_RECONNECT_MS 10000
+#define WIFI_POLL_MS 60000
+
+static uint32_t wifi_last_connect_ms = 0;
+static uint32_t wifi_last_poll_ms = 0;
+
+static bool wifi_configured(void) {
+    return CLAWDMETER_WIFI_SSID[0] != '\0' && CLAWDMETER_USAGE_URL[0] != '\0';
+}
+
+static void wifi_begin(void) {
+    if (!wifi_configured()) {
+        Serial.println("WiFi usage transport not configured");
+        return;
+    }
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(CLAWDMETER_WIFI_SSID, CLAWDMETER_WIFI_PASS);
+    wifi_last_connect_ms = millis();
+    Serial.printf("WiFi: connecting to %s\n", CLAWDMETER_WIFI_SSID);
+}
+
+static void wifi_usage_tick(void) {
+    if (!wifi_configured()) return;
+
+    uint32_t now = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+        if (now - wifi_last_connect_ms >= WIFI_RECONNECT_MS) {
+            Serial.printf("WiFi: reconnecting to %s\n", CLAWDMETER_WIFI_SSID);
+            WiFi.disconnect();
+            WiFi.begin(CLAWDMETER_WIFI_SSID, CLAWDMETER_WIFI_PASS);
+            wifi_last_connect_ms = now;
+        }
+        return;
+    }
+
+    if (wifi_last_poll_ms != 0 && now - wifi_last_poll_ms < WIFI_POLL_MS) return;
+    wifi_last_poll_ms = now;
+
+    HTTPClient http;
+    http.setTimeout(5000);
+    if (!http.begin(CLAWDMETER_USAGE_URL)) {
+        Serial.println("WiFi: HTTP begin failed");
+        return;
+    }
+
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+        String body = http.getString();
+        if (parse_json(body.c_str(), &usage)) {
+            apply_usage_update();
+            Serial.println("WIFI_ACK");
+        } else {
+            Serial.println("WIFI_NACK");
+        }
+    } else {
+        Serial.printf("WiFi: HTTP GET failed code=%d\n", code);
+    }
+    http.end();
 }
 
 // Serial command buffer. It also accepts the same compact JSON payload as BLE.
@@ -336,6 +416,7 @@ void setup() {
 
     // Init BLE data channel
     ble_init();
+    wifi_begin();
 
     // Physical buttons: back (GPIO 0) and forward (GPIO 18)
 #ifndef M5STACK_CORE2
@@ -473,6 +554,9 @@ void loop() {
 
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
+
+    // Poll the Mac usage endpoint over WiFi when configured.
+    wifi_usage_tick();
 
     // Process incoming BLE data
     if (ble_has_data()) {

@@ -7,21 +7,57 @@
 #include <string.h>
 #include <esp_heap_caps.h>
 
-// 20x20 grid. On 480x480 it fills the display; on Core2 it becomes a
-// centered 240x240 splash.
+// 20x20 grid. The mascot is intentionally small here so the splash screen can
+// double as a compact calendar view.
 #define GRID         20
-#define CELL         ((LCD_WIDTH < LCD_HEIGHT ? LCD_WIDTH : LCD_HEIGHT) / GRID)
+#ifdef M5STACK_CORE2
+#define CELL         5
+#define MASCOT_X     12
+#define MASCOT_Y     42
+#define CAL_X        124
+#define CAL_Y        40
+#define CAL_W        184
+#define CAL_CELL_H   19
+#define CAL_HEAD_H   24
+#define CAL_DOW_Y    30
+#define CAL_GRID_Y   50
+#define CAL_FONT_DAY font_styrene_12
+#define CAL_FONT_HDR font_styrene_16
+#else
+#define CELL         8
+#define MASCOT_X     20
+#define MASCOT_Y     100
+#define CAL_X        200
+#define CAL_Y        92
+#define CAL_W        260
+#define CAL_CELL_H   31
+#define CAL_HEAD_H   42
+#define CAL_DOW_Y    54
+#define CAL_GRID_Y   86
+#define CAL_FONT_DAY font_styrene_20
+#define CAL_FONT_HDR font_styrene_28
+#endif
 #define CANVAS_W     (GRID * CELL)
 #define CANVAS_H     (GRID * CELL)
+#define CAL_COLS     7
+#define CAL_ROWS     6
+#define CAL_CELL_W   (CAL_W / CAL_COLS)
 
 // Background fallback when palette is missing
 #define COL_EMPTY    0x0000  // true black (matches THEME_BG)
 
 LV_FONT_DECLARE(font_styrene_28);
+LV_FONT_DECLARE(font_styrene_20);
+LV_FONT_DECLARE(font_styrene_16);
+LV_FONT_DECLARE(font_styrene_12);
 
 static lv_obj_t *splash_container = NULL;
 static lv_obj_t *canvas = NULL;
 static lv_obj_t *label_status = NULL;     // shown only when no animations loaded
+static lv_obj_t *calendar_root = NULL;
+static lv_obj_t *calendar_title = NULL;
+static lv_obj_t *calendar_cells[CAL_ROWS * CAL_COLS] = {NULL};
+static lv_obj_t *calendar_labels[CAL_ROWS * CAL_COLS] = {NULL};
 static uint16_t *canvas_buf = NULL;        // 480x480 RGB565 (PSRAM)
 
 static uint16_t cur_anim = 0;
@@ -29,6 +65,9 @@ static uint16_t cur_frame = 0;
 static uint32_t frame_started_ms = 0;
 static uint32_t last_pick_ms = 0;
 static bool active = false;
+static int shown_year = 0;
+static int shown_month = 0;
+static int shown_day = 0;
 
 // While splash is showing, auto-cycle to the next animation in the current
 // rate-driven group every this many ms.
@@ -93,6 +132,109 @@ static void show_placeholder() {
     if (label_status) lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN);
 }
 
+static bool is_leap(int year) {
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+static int days_in_month(int year, int month) {
+    static const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && is_leap(year)) return 29;
+    if (month < 1 || month > 12) return 0;
+    return days[month - 1];
+}
+
+// Sakamoto's algorithm. Returns 0=Sunday, 1=Monday, ...
+static int weekday(int year, int month, int day) {
+    static const int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (month < 3) year--;
+    return (year + year / 4 - year / 100 + year / 400 + offsets[month - 1] + day) % 7;
+}
+
+static void calendar_clear_cell(int idx) {
+    lv_label_set_text(calendar_labels[idx], "");
+    lv_obj_set_style_bg_opa(calendar_cells[idx], LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(calendar_cells[idx], 0, 0);
+}
+
+static void calendar_set_cell(int idx, int day, bool today) {
+    lv_label_set_text_fmt(calendar_labels[idx], "%d", day);
+    lv_obj_set_style_text_color(calendar_labels[idx], today ? THEME_BG : THEME_TEXT, 0);
+    lv_obj_set_style_bg_color(calendar_cells[idx], today ? THEME_ACCENT : THEME_PANEL, 0);
+    lv_obj_set_style_bg_opa(calendar_cells[idx], today ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(calendar_cells[idx], today ? 6 : 0, 0);
+    lv_obj_set_style_border_width(calendar_cells[idx], today ? 0 : 0, 0);
+}
+
+static void calendar_render(int year, int month, int day) {
+    if (!calendar_root || year <= 0 || month <= 0 || day <= 0) return;
+
+    static const char* const months[] = {
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    };
+    lv_label_set_text_fmt(calendar_title, "%s %d", months[month - 1], year);
+
+    for (int i = 0; i < CAL_ROWS * CAL_COLS; i++) calendar_clear_cell(i);
+
+    int first = weekday(year, month, 1);
+    int count = days_in_month(year, month);
+    for (int d = 1; d <= count; d++) {
+        int idx = first + d - 1;
+        if (idx >= 0 && idx < CAL_ROWS * CAL_COLS) {
+            calendar_set_cell(idx, d, d == day);
+        }
+    }
+}
+
+static void init_calendar(lv_obj_t *parent) {
+    calendar_root = lv_obj_create(parent);
+    lv_obj_set_pos(calendar_root, CAL_X, CAL_Y);
+    lv_obj_set_size(calendar_root, CAL_W, LCD_HEIGHT - CAL_Y - 8);
+    lv_obj_set_style_bg_opa(calendar_root, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(calendar_root, 0, 0);
+    lv_obj_set_style_pad_all(calendar_root, 0, 0);
+    lv_obj_clear_flag(calendar_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(calendar_root, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    calendar_title = lv_label_create(calendar_root);
+    lv_label_set_text(calendar_title, "Calendar");
+    lv_obj_set_style_text_font(calendar_title, &CAL_FONT_HDR, 0);
+    lv_obj_set_style_text_color(calendar_title, THEME_TEXT, 0);
+    lv_obj_set_size(calendar_title, CAL_W, CAL_HEAD_H);
+    lv_obj_set_style_text_align(calendar_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(calendar_title, 0, 0);
+
+    static const char* const dows[] = {"S", "M", "T", "W", "T", "F", "S"};
+    for (int c = 0; c < CAL_COLS; c++) {
+        lv_obj_t* lbl = lv_label_create(calendar_root);
+        lv_label_set_text(lbl, dows[c]);
+        lv_obj_set_style_text_font(lbl, &CAL_FONT_DAY, 0);
+        lv_obj_set_style_text_color(lbl, THEME_DIM, 0);
+        lv_obj_set_size(lbl, CAL_CELL_W, CAL_CELL_H);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(lbl, c * CAL_CELL_W, CAL_DOW_Y);
+    }
+
+    for (int r = 0; r < CAL_ROWS; r++) {
+        for (int c = 0; c < CAL_COLS; c++) {
+            int idx = r * CAL_COLS + c;
+            calendar_cells[idx] = lv_obj_create(calendar_root);
+            lv_obj_set_pos(calendar_cells[idx], c * CAL_CELL_W, CAL_GRID_Y + r * CAL_CELL_H);
+            lv_obj_set_size(calendar_cells[idx], CAL_CELL_W - 2, CAL_CELL_H - 2);
+            lv_obj_set_style_bg_opa(calendar_cells[idx], LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(calendar_cells[idx], 0, 0);
+            lv_obj_set_style_pad_all(calendar_cells[idx], 0, 0);
+            lv_obj_clear_flag(calendar_cells[idx], LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(calendar_cells[idx], LV_OBJ_FLAG_EVENT_BUBBLE);
+
+            calendar_labels[idx] = lv_label_create(calendar_cells[idx]);
+            lv_obj_set_style_text_font(calendar_labels[idx], &CAL_FONT_DAY, 0);
+            lv_obj_set_style_text_color(calendar_labels[idx], THEME_TEXT, 0);
+            lv_obj_center(calendar_labels[idx]);
+        }
+    }
+}
+
 void splash_init(lv_obj_t *parent) {
     canvas_buf = (uint16_t*)heap_caps_malloc(CANVAS_W * CANVAS_H * 2, MALLOC_CAP_SPIRAM);
     if (!canvas_buf) {
@@ -111,7 +253,10 @@ void splash_init(lv_obj_t *parent) {
 
     canvas = lv_canvas_create(splash_container);
     lv_canvas_set_buffer(canvas, canvas_buf, CANVAS_W, CANVAS_H, LV_COLOR_FORMAT_RGB565);
-    lv_obj_center(canvas);
+    lv_obj_set_pos(canvas, MASCOT_X, MASCOT_Y);
+    lv_obj_add_flag(canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    init_calendar(splash_container);
 
     // Placeholder label (visible only when no animations are loaded)
     label_status = lv_label_create(splash_container);
@@ -185,6 +330,15 @@ void splash_pick_for_current_rate(void) {
     last_pick_ms = frame_started_ms;
     const splash_anim_def_t *a = &splash_anims[cur_anim];
     render_frame(a->frames[0], a->palette);
+}
+
+void splash_update_calendar(const UsageData* data) {
+    if (!data || data->year <= 0 || data->month <= 0 || data->day <= 0) return;
+    if (data->year == shown_year && data->month == shown_month && data->day == shown_day) return;
+    shown_year = data->year;
+    shown_month = data->month;
+    shown_day = data->day;
+    calendar_render(shown_year, shown_month, shown_day);
 }
 
 bool splash_is_active(void) { return active; }

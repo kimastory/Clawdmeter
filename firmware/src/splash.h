@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <lvgl.h>
+#include "data.h"
 
 // Initialize splash module. Creates the canvas widget inside `parent` and
 // allocates the 480x480 pixel buffer (PSRAM).
@@ -20,6 +21,9 @@ void splash_hide(void);
 // Called automatically by splash_show(); also exposed so other modules can
 // trigger a re-pick when the rate group changes mid-display.
 void splash_pick_for_current_rate(void);
+
+// Update the calendar overlay shown alongside the mascot.
+void splash_update_calendar(const UsageData* data);
 
 // True when splash is currently rendering (used to gate re-picks).
 bool splash_is_active(void);
