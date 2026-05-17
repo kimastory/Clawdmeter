@@ -15,16 +15,17 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
-DEVICE_NAME = "Claude Controller"
-SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
-RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
-REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
+DEVICE_NAME = "Clawdmeter Monitor"
+SERVICE_UUID = "4c41555a-4465-7669-6365-000000000101"
+RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000102"
+REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000104"
 
 POLL_INTERVAL = 60
 TICK = 5
@@ -194,6 +195,17 @@ async def poll_api(token: str) -> dict | None:
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
     }
+    now_local = datetime.now()
+    payload.update(
+        {
+            "y": now_local.year,
+            "m": now_local.month,
+            "d": now_local.day,
+            "hh": now_local.hour,
+            "mm": now_local.minute,
+            "ss": now_local.second,
+        }
+    )
     return payload
 
 
@@ -216,7 +228,7 @@ class Session:
         data = json.dumps(payload, separators=(",", ":")).encode()
         log(f"Sending: {data.decode()}")
         try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=True)
             return True
         except BleakError as e:
             log(f"Write failed: {e}")
