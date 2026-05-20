@@ -30,6 +30,7 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000104"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+MAX_RETRY_BACKOFF = 10
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -320,7 +321,7 @@ async def main() -> None:
                     await asyncio.wait_for(stop_event.wait(), timeout=backoff)
                 except asyncio.TimeoutError:
                     pass
-                backoff = min(backoff * 2, 60)
+                backoff = min(backoff * 2, MAX_RETRY_BACKOFF)
                 continue
 
         ok = await connect_and_run(address, stop_event)
@@ -331,7 +332,7 @@ async def main() -> None:
                 await asyncio.wait_for(stop_event.wait(), timeout=backoff)
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 2, MAX_RETRY_BACKOFF)
         else:
             backoff = 1
 
