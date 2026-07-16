@@ -41,6 +41,17 @@
 #define CAL_FONT_DAY font_styrene_20
 #define CAL_FONT_HDR font_styrene_28
 #endif
+// Info panel: the mascot is a small always-on companion in the top-left
+// corner (the big clock + calendar are drawn separately by panel.cpp).
+#ifdef CLAWDMETER_INFO_PANEL
+#undef CELL
+#undef MASCOT_X
+#undef MASCOT_Y
+#define CELL         2
+#define MASCOT_X     6
+#define MASCOT_Y     6
+#endif
+
 #define CANVAS_W     (GRID * CELL)
 #define CANVAS_H     (GRID * CELL)
 #define CAL_COLS     7
@@ -70,6 +81,7 @@ static uint16_t cur_frame = 0;
 static uint32_t frame_started_ms = 0;
 static uint32_t last_pick_ms = 0;
 static bool active = false;
+static int group_override = -1;  // -1 = use usage_rate_group(); else forced mood
 static int shown_year = 0;
 static int shown_month = 0;
 static int shown_day = 0;
@@ -91,6 +103,16 @@ static int8_t  group_lists[GROUP_COUNT][GROUP_MAX];
 static uint8_t group_size[GROUP_COUNT] = {0};
 static uint8_t group_rotation[GROUP_COUNT] = {0};
 
+#ifdef CLAWDMETER_INFO_PANEL
+// Info panel: groups map to the puppy's MOOD, driven by weather + air quality.
+// 0 = sleepy/down (bad air or storm) … 3 = happy/playful (clean + clear).
+static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
+    { "sleep", "idle", NULL, NULL },     // Group 0 — sleepy / down
+    { "idle", "blink", NULL, NULL },     // Group 1 — calm
+    { "wag", "idle", NULL, NULL },       // Group 2 — content
+    { "happy", "wag", NULL, NULL },      // Group 3 — happy / playful
+};
+#else
 static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
     // Group 0 — idle / sleepy
     { "expression sleep", "idle breathe", "idle blink", "expression wink" },
@@ -101,6 +123,7 @@ static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
     // Group 3 — heavy
     { "dance bounce dj", "dance sway dj", "dance djmix", NULL },
 };
+#endif
 
 static void resolve_group_lists(void) {
     for (int g = 0; g < GROUP_COUNT; g++) {
@@ -271,6 +294,24 @@ void splash_init(lv_obj_t *parent) {
         return;
     }
 
+#ifdef CLAWDMETER_INFO_PANEL
+    // Info panel: the mascot is a small always-on companion. It is added to the
+    // screen LAST (after panel.cpp's screen containers), so as the topmost
+    // sibling it draws above every screen and is captured by screenshots.
+    // Clock + calendar are owned by panel.cpp.
+    canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(canvas, canvas_buf, CANVAS_W, CANVAS_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(canvas, MASCOT_X, MASCOT_Y);
+    resolve_group_lists();
+    if (SPLASH_ANIM_COUNT > 0) {
+        const splash_anim_def_t *a = &splash_anims[0];
+        render_frame(a->frames[0], a->palette);
+        frame_started_ms = millis();
+    }
+    active = true;   // there is no separate splash screen; always animate
+    return;
+#endif
+
     splash_container = lv_obj_create(parent);
     lv_obj_set_size(splash_container, LCD_WIDTH, LCD_HEIGHT);
     lv_obj_set_pos(splash_container, 0, 0);
@@ -352,9 +393,16 @@ void splash_next(void) {
     Serial.printf("splash: -> %s\n", a->name);
 }
 
+void splash_set_group(int group) {
+    if (group < 0) { group_override = -1; return; }
+    if (group >= GROUP_COUNT) group = GROUP_COUNT - 1;
+    group_override = group;
+    splash_pick_for_current_rate();  // reflect the new mood immediately
+}
+
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
-    int g = usage_rate_group();
+    int g = (group_override >= 0) ? group_override : usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;
     if (group_size[g] == 0) return;
 
@@ -387,6 +435,26 @@ void splash_update_calendar(const UsageData* data) {
         shown_year = data->year;
         shown_month = data->month;
         shown_day = data->day;
+        calendar_render(shown_year, shown_month, shown_day);
+    }
+}
+
+void splash_set_datetime(int year, int month, int day,
+                         int hour, int minute, int second) {
+    if (year <= 0 || month <= 0 || day <= 0) return;
+    if (hour >= 0 && hour < 24 && minute >= 0 && minute < 60 &&
+        second >= 0 && second < 60) {
+        clock_hour = hour;
+        clock_minute = minute;
+        clock_second = second;
+        clock_base_ms = millis();
+        last_rendered_second = -1;
+        render_clock();
+    }
+    if (year != shown_year || month != shown_month || day != shown_day) {
+        shown_year = year;
+        shown_month = month;
+        shown_day = day;
         calendar_render(shown_year, shown_month, shown_day);
     }
 }

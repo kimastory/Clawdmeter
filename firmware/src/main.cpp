@@ -16,6 +16,13 @@
 #include "wifi_config.h"
 #endif
 
+#ifdef CLAWDMETER_INFO_PANEL
+#include "panel.h"
+#include "info_source.h"
+#include "stock_source.h"
+#include "pets.h"
+#endif
+
 // Physical buttons (global, screen-independent):
 //   BTN_BACK   (GPIO 0)  — left,  send Space (Claude Code voice mode push-to-talk)
 //   BTN_FWD    (GPIO 18) — right, send Shift+Tab (Claude Code mode toggle)
@@ -335,7 +342,15 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) {
                 send_screenshot();
-            } else if (cmd_pos > 0 && cmd_buf[0] == '{') {
+            }
+#ifdef CLAWDMETER_INFO_PANEL
+            else if (strncmp(cmd_buf, "scr ", 4) == 0) {
+                panel_show_index(atoi(cmd_buf + 4));
+                Serial.println("SCR_ACK");
+            }
+#endif
+#ifndef CLAWDMETER_INFO_PANEL
+            else if (cmd_pos > 0 && cmd_buf[0] == '{') {
                 if (parse_json(cmd_buf, &usage)) {
                     apply_usage_update();
                     Serial.println("SERIAL_ACK");
@@ -343,6 +358,7 @@ static void check_serial_cmd() {
                     Serial.println("SERIAL_NACK");
                 }
             }
+#endif
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -417,9 +433,14 @@ void setup() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
+#ifdef CLAWDMETER_INFO_PANEL
+    // Standalone WiFi info panel — no BLE, no host daemon.
+    info_source_begin();
+#else
     // Init BLE data channel
     ble_init();
     wifi_begin();
+#endif
 
     // Physical buttons: back (GPIO 0) and forward (GPIO 18)
 #ifndef M5STACK_CORE2
@@ -427,6 +448,11 @@ void setup() {
     pinMode(BTN_FWD,  INPUT_PULLUP);
 #endif
 
+#ifdef CLAWDMETER_INFO_PANEL
+    // Build info-panel screens (pet/clock/calendar + weather + air quality)
+    panel_init();
+    Serial.println("Info panel ready (WiFi, standalone)");
+#else
     // Build dashboard
     ui_init();
 
@@ -439,6 +465,7 @@ void setup() {
     ui_show_screen(SCREEN_SPLASH);
 
     Serial.println("Dashboard ready, waiting for data on BLE...");
+#endif
 }
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
@@ -479,18 +506,28 @@ void loop() {
     touch_read();
 #endif
     lv_timer_handler();
+#ifndef CLAWDMETER_INFO_PANEL
     ui_tick_anim();
     ble_tick();
+#endif
     power_tick();
     imu_tick();
+#ifdef CLAWDMETER_INFO_PANEL
+    pets_tick();
+#else
     splash_tick();
+#endif
 
     // Three-button input (global, screen-independent):
     //   LEFT  (GPIO 0)  → Space (voice-mode push-to-talk; press & release tracked)
     //   RIGHT (GPIO 18) → Shift+Tab (Claude Code mode toggle)
     //   PWR   (AXP)     → cycle screens; on splash, cycle animations
     {
-#ifdef M5STACK_CORE2
+#ifdef CLAWDMETER_INFO_PANEL
+        // Info panel: middle button cycles screens, side button cycles mascot.
+        if (M5.BtnB.wasClicked() || power_pwr_pressed()) panel_next_screen();
+        if (M5.BtnA.wasClicked()) panel_pet_next();
+#elif defined(M5STACK_CORE2)
         static bool back_was = false, fwd_was = false;
         bool back_now = M5.BtnA.isPressed();
         bool fwd_now  = M5.BtnC.isPressed();
@@ -537,6 +574,7 @@ void loop() {
     handle_rotation_change();
 #endif
 
+#ifndef CLAWDMETER_INFO_PANEL
     // Update BLE status on screen when state changes
     ble_state_t bs = ble_get_state();
     if (bs != last_ble_state) {
@@ -554,10 +592,17 @@ void loop() {
         last_charging = charging;
         ui_update_battery(pct, charging);
     }
+#endif
 
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
 
+#ifdef CLAWDMETER_INFO_PANEL
+    // Standalone: poll weather/AQI/NTP and refresh the info screens.
+    if (info_source_tick()) panel_update(info_source_data());
+    if (stock_source_tick()) panel_update_stock(stock_source_data());
+    panel_tick();
+#else
     // Poll the Mac usage endpoint over WiFi when configured.
     wifi_usage_tick();
 
@@ -570,6 +615,7 @@ void loop() {
             ble_send_nack();
         }
     }
+#endif
 
     delay(5);
 }
