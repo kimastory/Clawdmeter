@@ -12,6 +12,105 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
 
+> **This fork** adds an **M5Stack Core2** port and a second, completely standalone
+> mode: a **WiFi info panel** with clock, weather, air quality and a stock ticker
+> that needs no host Mac, no BLE and no OAuth token. See
+> [M5Stack Core2 info panel](#m5stack-core2-info-panel) below. Everything above and
+> below that section describes the original Waveshare AMOLED + Claude-usage build,
+> which still works unchanged.
+
+## M5Stack Core2 info panel
+
+A standalone build for the [M5Stack Core2](https://docs.m5stack.com/en/core/core2) (320×240 ILI9342C).
+Unlike the usage meter, it talks straight to the internet — there is no companion
+daemon, no Bluetooth pairing and no Claude token involved. Plug it into any USB
+charger and it works.
+
+Three screens auto-cycle every 15 s:
+
+| Screen    | Contents                                                                       |
+| --------- | ------------------------------------------------------------------------------ |
+| **CLOCK** | Big clock + Korean calendar, with pixel-art dog and cat companions              |
+| **INFO**  | Current/feels-like temp, daily high–low, humidity, precipitation chance, PM2.5 / PM10 / US AQI |
+| **STOCK** | Ticker name, live price, trend chart, and gain/loss against your avg-buy price  |
+
+Data sources: [Open-Meteo](https://open-meteo.com) forecast + air-quality APIs
+(no API key needed), Yahoo Finance `query1` chart endpoint for the ticker, and
+NTP (`pool.ntp.org`, `time.google.com`, `time.cloudflare.com`) for the clock.
+
+### Configure
+
+Copy the example header and fill it in — `wifi_config.h` is git-ignored, so your
+credentials never get committed:
+
+```bash
+cp firmware/src/wifi_config.example.h firmware/src/wifi_config.h
+$EDITOR firmware/src/wifi_config.h
+```
+
+At minimum set `CLAWDMETER_WIFI_SSID` and `CLAWDMETER_WIFI_PASS`. The info panel
+also reads `CLAWDMETER_LAT` / `CLAWDMETER_LON` (weather + air-quality location),
+`CLAWDMETER_TZ` (POSIX timezone, defaults to Seoul/KST), and the optional
+`CLAWDMETER_STOCK_*` values for the ticker screen. `CLAWDMETER_USAGE_URL` is
+ignored by this build.
+
+### Build and flash
+
+```bash
+pio run -d firmware -e m5stack_core2_info -t upload --upload-port /dev/cu.usbserial-XXXXXXXX
+```
+
+The Core2 shows up as a CP2104 (`/dev/cu.usbserial-*` on macOS). The two Core2
+builds are:
+
+| Environment            | What it does                                                |
+| ---------------------- | ----------------------------------------------------------- |
+| `m5stack_core2_info`   | Standalone WiFi info panel (this section)                    |
+| `m5stack_core2_aws`    | Original Claude-usage meter, fed over BLE or WiFi HTTP       |
+
+### Buttons
+
+| Button   | Function                                    |
+| -------- | ------------------------------------------- |
+| **BtnA** | Cycle the pet animation                     |
+| **BtnB** | Next screen (the PWR key does the same)     |
+| **BtnC** | Unused in this build                        |
+
+The HID keyboard passthrough (Space / Shift+Tab) is deliberately absent here —
+there is no BLE in the info-panel build at all.
+
+### QA screenshots
+
+The firmware can dump its framebuffer over USB serial, which is how the
+screenshots in `screenshots/` were captured:
+
+```bash
+./screenshot-core2.sh out.png /dev/cu.usbserial-XXXXXXXX
+```
+
+Or drive it directly over the serial monitor: `screenshot` grabs the current
+screen, and `scr N` jumps to screen N (0 = clock, 1 = info, 2 = stock) so you can
+capture each one deterministically. Conversion from RGB565 to PNG needs `ffmpeg`,
+and the capture script needs `pyserial`.
+
+**Note:** opening the CP2104 port normally resets the ESP32. `screenshot-core2.sh`
+pulls DTR/RTS low *before* opening the port specifically to avoid that, so
+whatever is on screen survives the capture.
+
+### Korean fonts
+
+The info panel renders Korean, which the upstream ASCII-only fonts can't do.
+`tools/gen_kr_fonts.sh` generates subsetted [Pretendard](https://github.com/orioncactus/pretendard)
+LVGL fonts containing only the glyphs the UI actually draws (plus ASCII and the
+degree sign, so temperatures render as `25°`), which keeps each font small:
+
+```bash
+./tools/gen_kr_fonts.sh    # needs npx + Pretendard OTFs in ~/Library/Fonts
+```
+
+Re-run it after adding any new Korean string to the UI, otherwise the new glyphs
+render blank.
+
 ## Screens
 
 The device boots into the splash and stays there until you press the middle (PWR) button, which cycles between Usage and Bluetooth. Tap the screen anywhere (except the Reset zone on the Bluetooth screen) to flip back to the splash; tap again to dismiss it.
