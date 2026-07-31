@@ -15,7 +15,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -31,6 +31,7 @@ POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
 MAX_RETRY_BACKOFF = 10
+MAX_SCAN_MISSES_BEFORE_RESTART = 30
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -38,31 +39,24 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
-API_URL = "https://api.anthropic.com/v1/messages"
-API_HEADERS_TEMPLATE = {
-    "anthropic-version": "2023-06-01",
-    "anthropic-beta": "oauth-2025-04-20",
-    "Content-Type": "application/json",
-    "User-Agent": "claude-code/2.1.5",
-}
-API_BODY = {
-    "model": "claude-haiku-4-5-20251001",
-    "max_tokens": 1,
-    "messages": [{"role": "user", "content": "hi"}],
-}
+USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = os.environ.get(
+    "CLAUDE_CODE_OAUTH_CLIENT_ID",
+    "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+)
+API_HEADERS_TEMPLATE = {"User-Agent": "claude-code/2.1.5"}
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def _extract_access_token(blob: str) -> str | None:
-    """Pull the accessToken out of a credentials blob.
+def _extract_credentials(blob: str) -> dict | None:
+    """Pull Claude Code OAuth credentials out of a credentials blob.
 
     Claude Code stores credentials as a JSON object; the blob may also be
-    nested ({"claudeAiOauth": {"accessToken": "..."}}). Fall back to a
-    regex match so unexpected shapes still work, and finally treat the
-    blob as a raw token if nothing else matches.
+    nested ({"claudeAiOauth": {"accessToken": "...", ...}}).
     """
     blob = blob.strip()
     if not blob:
@@ -72,23 +66,21 @@ def _extract_access_token(blob: str) -> str | None:
     except json.JSONDecodeError:
         data = None
     if isinstance(data, dict):
-        # direct: {"accessToken": "..."}
-        if isinstance(data.get("accessToken"), str):
-            return data["accessToken"]
-        # nested: {"claudeAiOauth": {"accessToken": "..."}}
-        for v in data.values():
-            if isinstance(v, dict) and isinstance(v.get("accessToken"), str):
-                return v["accessToken"]
-    m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', blob)
-    if m:
-        return m.group(1)
+        creds = data.get("claudeAiOauth") if isinstance(data.get("claudeAiOauth"), dict) else data
+        if isinstance(creds.get("accessToken"), str):
+            return {
+                "accessToken": creds.get("accessToken"),
+                "refreshToken": creds.get("refreshToken"),
+                "expiresAt": creds.get("expiresAt"),
+                "raw": data,
+            }
     # Raw token (no JSON wrapper) — must look plausible (sk-ant-... etc.)
     if re.fullmatch(r"[A-Za-z0-9_\-.~+/=]{20,}", blob):
-        return blob
+        return {"accessToken": blob}
     return None
 
 
-def _read_token_keychain() -> str | None:
+def _read_credentials_keychain() -> dict | None:
     try:
         out = subprocess.run(
             [
@@ -111,22 +103,98 @@ def _read_token_keychain() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f"Keychain access error: {e}")
         return None
-    return _extract_access_token(out.stdout)
+    return _extract_credentials(out.stdout)
 
 
-def _read_token_file() -> str | None:
+def _read_credentials_file() -> dict | None:
     try:
         raw = CREDENTIALS_PATH.read_text()
     except OSError as e:
         log(f"Error reading credentials: {e}")
         return None
-    return _extract_access_token(raw)
+    return _extract_credentials(raw)
 
 
-def read_token() -> str | None:
+def read_credentials() -> dict | None:
     if sys.platform == "darwin":
-        return _read_token_keychain()
-    return _read_token_file()
+        return _read_credentials_keychain() or _read_credentials_file()
+    return _read_credentials_file()
+
+
+def _is_expired(creds: dict) -> bool:
+    expires_at = creds.get("expiresAt")
+    return isinstance(expires_at, (int, float)) and expires_at <= time.time() * 1000
+
+
+def _write_credentials_keychain(creds: dict) -> None:
+    raw = creds.get("raw")
+    if not isinstance(raw, dict):
+        return
+    target = raw.get("claudeAiOauth") if isinstance(raw.get("claudeAiOauth"), dict) else raw
+    target["accessToken"] = creds["accessToken"]
+    if creds.get("refreshToken"):
+        target["refreshToken"] = creds["refreshToken"]
+    if creds.get("expiresAt"):
+        target["expiresAt"] = creds["expiresAt"]
+    try:
+        subprocess.run(
+            [
+                "security",
+                "add-generic-password",
+                "-U",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                getpass.getuser(),
+                "-w",
+                json.dumps(raw, separators=(",", ":")),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"Keychain credential update failed: {e}")
+
+
+async def refresh_credentials(creds: dict) -> dict | None:
+    refresh_token = creds.get("refreshToken")
+    if not refresh_token:
+        return None
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(TOKEN_REFRESH_URL, data=data)
+    except httpx.HTTPError as e:
+        log(f"Token refresh failed: {e}")
+        return None
+    if resp.status_code != 200:
+        log(f"Token refresh failed: HTTP {resp.status_code}")
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        log("Token refresh failed: invalid JSON response")
+        return None
+    access_token = body.get("access_token")
+    if not access_token:
+        log("Token refresh failed: missing access_token")
+        return None
+    refreshed = dict(creds)
+    refreshed["accessToken"] = access_token
+    refreshed["refreshToken"] = body.get("refresh_token") or refresh_token
+    if body.get("expires_in"):
+        refreshed["expiresAt"] = int(time.time() * 1000) + int(body["expires_in"]) * 1000
+    elif body.get("expires_at"):
+        refreshed["expiresAt"] = body["expires_at"]
+    if sys.platform == "darwin":
+        _write_credentials_keychain(refreshed)
+    return refreshed
 
 
 def load_cached_address() -> str | None:
@@ -159,41 +227,64 @@ async def scan_for_device() -> str | None:
     return None
 
 
-async def poll_api(token: str) -> dict | None:
+def _reset_minutes(value: str | None) -> int:
+    if not value:
+        return 0
+    try:
+        target = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    return max(0, round((target - datetime.now(timezone.utc)).total_seconds() / 60))
+
+
+async def poll_api(creds: dict) -> dict | None:
+    if _is_expired(creds):
+        refreshed = await refresh_credentials(creds)
+        if not refreshed:
+            log("OAuth credentials expired and refresh failed")
+            return None
+        creds = refreshed
+
     headers = dict(API_HEADERS_TEMPLATE)
-    headers["Authorization"] = f"Bearer {token}"
+    headers["Authorization"] = f"Bearer {creds['accessToken']}"
     try:
         async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+            resp = await http.get(USAGE_API_URL, headers=headers)
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
 
-    def hdr(name: str, default: str = "0") -> str:
-        return resp.headers.get(name, default)
+    if resp.status_code == 401 and creds.get("refreshToken"):
+        refreshed = await refresh_credentials(creds)
+        if refreshed:
+            return await poll_api(refreshed)
+    if resp.status_code != 200:
+        log(f"API call failed: HTTP {resp.status_code}")
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        log("API call failed: invalid JSON response")
+        return None
 
-    now = time.time()
-
-    def reset_minutes(reset_ts: str) -> int:
+    def pct(util) -> int:
         try:
-            r = float(reset_ts)
-        except ValueError:
+            return int(round(float(util)))
+        except (TypeError, ValueError):
             return 0
-        mins = (r - now) / 60.0
-        return int(round(mins)) if mins > 0 else 0
 
-    def pct(util: str) -> int:
-        try:
-            return int(round(float(util) * 100))
-        except ValueError:
-            return 0
+    five_hour = body.get("five_hour") or {}
+    seven_day = body.get("seven_day") or {}
+    if "utilization" not in five_hour and "utilization" not in seven_day:
+        log("API call failed: usage fields missing")
+        return None
 
     payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+        "s": pct(five_hour.get("utilization")),
+        "sr": _reset_minutes(five_hour.get("resets_at")),
+        "w": pct(seven_day.get("utilization")),
+        "wr": _reset_minutes(seven_day.get("resets_at")),
+        "st": "allowed",
         "ok": True,
     }
     now_local = datetime.now()
@@ -267,11 +358,11 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                token = read_token()
-                if not token:
-                    log("No token; skipping poll")
+                creds = read_credentials()
+                if not creds:
+                    log("No credentials; skipping poll")
                 else:
-                    payload = await poll_api(token)
+                    payload = await poll_api(creds)
                     if payload is not None:
                         if await session.write_payload(payload):
                             last_poll = time.time()
@@ -309,14 +400,20 @@ async def main() -> None:
     log(f"Poll interval: {POLL_INTERVAL}s")
 
     backoff = 1
+    consecutive_scan_misses = 0
     while not stop_event.is_set():
         address = load_cached_address()
         if not address:
             address = await scan_for_device()
             if address:
+                consecutive_scan_misses = 0
                 save_address(address)
             else:
+                consecutive_scan_misses += 1
                 log(f"Device not found, retrying in {backoff}s...")
+                if consecutive_scan_misses >= MAX_SCAN_MISSES_BEFORE_RESTART:
+                    log("Device scan appears stuck; exiting for LaunchAgent restart")
+                    sys.exit(2)
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=backoff)
                 except asyncio.TimeoutError:
